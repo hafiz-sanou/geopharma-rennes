@@ -120,7 +120,7 @@ Master Mathématiques Appliquées & Statistiques — Magistère 2
 Université de Rennes · 2025  
 
 📧 [hafizsanou2004@gmail.com](mailto:hafizsanou2004@gmail.com)  
-🔗 [Portfolio](https://hafiz-sanou.vercel.app) · [GitHub](https://github.com/hafiz-sanou)
+🔗 [Portfolio](https://portfolio-zeta-lemon-29.vercel.app) · [GitHub](https://github.com/hafiz-sanou)
 
 ---
 
