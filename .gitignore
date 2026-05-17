@@ -1,0 +1,9 @@
+data/raw/
+outputs/
+rapport.html
+.Rhistory
+.Rdata
+*.shp
+*.shx
+*.dbf
+*.prj

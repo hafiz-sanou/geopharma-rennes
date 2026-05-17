@@ -1,0 +1,883 @@
+---
+title: "Optimisation spatiale de l'implantation des pharmacies à Rennes"
+author: "Hafiz | Magistère 2 | Statistique Spatiale"
+output:
+  flexdashboard::flex_dashboard:
+    storyboard: true
+    social: menu
+    source_code: embed
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(sf)
+library(tidyverse)
+library(ggplot2)
+library(viridis)
+library(tmap)
+library(leaflet)
+library(plotly)
+library(DT)
+library(spdep)
+library(knitr)
+library(kableExtra)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath("./"))
+
+tmap_mode("view")
+```
+
+```{r chargement, include=FALSE}
+iris_rennes  <- readRDS("data/iris_rennes.rds")
+pharmacies   <- readRDS("data/pharmacies.rds")
+hopitaux     <- readRDS("data/hopitaux.rds")
+medecins     <- readRDS("data/medecins.rds")
+transport    <- readRDS("data/transport.rds")
+rennes_poly  <- readRDS("data/rennes_contour.rds")
+matrices_W   <- readRDS("data/matrices_W.rds")
+
+resultats_scoring <- readRDS("outputs/stats/resultats_scoring.rds")
+resultats_ripley  <- readRDS("outputs/stats/resultats_ripley.rds")
+comp_W            <- readRDS("outputs/stats/comparaison_matrices_W.rds")
+
+iris_optimal <- resultats_scoring$iris_optimal
+top10        <- resultats_scoring$top10
+tableau_comp <- resultats_scoring$tableau_comp
+df_radar     <- resultats_scoring$df_radar
+iris_ranked  <- resultats_scoring$iris_ranked
+
+W_queen  <- matrices_W$W_queen
+nb_queen <- matrices_W$nb_queen
+
+top3_codes <- iris_ranked %>% head(3) %>% pull(CODE_IRIS)
+
+iris_rennes <- iris_rennes %>%
+  mutate(
+    statut_pharma = case_when(
+      nb_pharmacies > 0        ~ "IRIS avec pharmacie",
+      desert_pharma == 1       ~ "Desert pharmaceutique (plus de 500m)",
+      zone_sans_pharmacie == 1 ~ "Sans pharmacie (moins de 500m)",
+      TRUE                     ~ "Autre"
+    ),
+    statut_pharma = factor(statut_pharma, levels = c(
+      "IRIS avec pharmacie",
+      "Sans pharmacie (moins de 500m)",
+      "Desert pharmaceutique (plus de 500m)"
+    )),
+    lisa_cluster_label = case_when(
+      lisa_cluster == "HH" ~ "HH : Desert entouree de deserts",
+      lisa_cluster == "LL" ~ "LL : Bien couvert, voisins bien couverts",
+      lisa_cluster == "HL" ~ "HL : Desert isole",
+      lisa_cluster == "LH" ~ "LH : Bien couvert, voisins eloignes",
+      TRUE                 ~ "NS : Non significatif"
+    )
+  )
+```
+
+### Contexte et problématique {data-commentary-width="420"}
+
+```{r carte_intro}
+tm_shape(iris_rennes) +
+  tm_polygons(
+    fill            = "POP_TOTAL",
+    fill.scale      = tm_scale_intervals(style = "quantile",
+                                         values = "YlOrRd"),
+    fill.legend     = tm_legend(title = "Population par IRIS"),
+    fill_alpha      = 0.5,
+    id              = "NOM_IRIS",
+    popup.vars      = c(
+      "Population"          = "POP_TOTAL",
+      "Densite (hab/km2)"   = "DENSITE_POP",
+      "Nb pharmacies"       = "nb_pharmacies",
+      "Distance pharma (m)" = "dist_min_pharmacie_m"
+    )
+  ) +
+  tm_shape(pharmacies) +
+  tm_dots(
+    fill        = "#e63946",
+    size        = 0.4,
+    fill.legend = tm_legend(title = "Pharmacies"),
+    id          = "name"
+  ) +
+  tm_shape(hopitaux) +
+  tm_dots(
+    fill        = "#2d6a4f",
+    size        = 0.4,
+    shape       = 15,
+    fill.legend = tm_legend(title = "Hopitaux"),
+    id          = "name"
+  )
+```
+
+------------------------------------------------------------------------
+
+**Présentation du projet**
+
+Ce rapport est une étude de géomarketing portant sur l'optimisation de l'implantation d'une nouvelle pharmacie dans la commune de Rennes. Il mobilise des méthodes avancées de statistique spatiale : analyse exploratoire des données géographiques, autocorrélation spatiale globale et locale, analyse des processus ponctuels, et scoring multicritère.
+
+**Problématique**
+
+La question centrale de cette étude est la suivante : où implanter une nouvelle pharmacie à Rennes pour maximiser l'accès aux soins pharmaceutiques tout en répondant aux besoins réels de la population ?
+
+Cette problématique se justifie par trois constats issus des données. Premièrement, 42 IRIS sur 93 ne possèdent aucune pharmacie en leur sein. Deuxièmement, 20 IRIS constituent des déserts pharmaceutiques, c'est-à-dire des zones situées à plus de 500 mètres de la pharmacie la plus proche. Troisièmement, ces déserts ne sont pas distribués aléatoirement dans l'espace, ce que les tests d'autocorrélation spatiale confirmeront.
+
+**Zone d'étude et unité statistique**
+
+La commune de Rennes (code INSEE 35238) est découpée en 93 IRIS (Ilots Regroupés pour l'Information Statistique). L'IRIS constitue l'unité statistique de cette analyse car c'est l'échelle la plus fine disponible pour les données socio-démographiques de l'INSEE. La population totale est de 227 830 habitants selon le Recensement de la Population 2022.
+
+**Sources de données**
+
+Les contours IRIS proviennent de l'IGN (édition 2024). Les données de population sont issues du Recensement de la Population 2022 de l'INSEE. Les points d'intérêt (pharmacies, hôpitaux, médecins, transports) ont été collectés via OpenStreetMap en mars 2024.
+
+La carte ci-contre présente la population par IRIS ainsi que les pharmacies (points rouges) et les établissements hospitaliers (carrés verts). On observe une concentration des pharmacies dans le centre-ville, avec une couverture quasi absente en périphérie.
+
+------------------------------------------------------------------------
+
+### Tâche 1 : Caractéristiques sociodémographiques des IRIS {data-commentary-width="420"}
+
+```{r carte_sociodem}
+tm_shape(iris_rennes) +
+  tm_polygons(
+    fill        = "PART_65P",
+    fill.scale  = tm_scale_intervals(style = "quantile",
+                                     values = "Blues"),
+    fill.legend = tm_legend(title = "Part des 65 ans et plus"),
+    fill_alpha  = 0.65,
+    id          = "NOM_IRIS",
+    popup.vars  = c(
+      "Population totale" = "POP_TOTAL",
+      "Part 65+ (%)"      = "PART_65P",
+      "Part 0-14 ans (%)" = "PART_0_14",
+      "Densite (hab/km2)" = "DENSITE_POP"
+    )
+  ) +
+  tm_shape(pharmacies) +
+  tm_dots(fill = "#e63946", size = 0.45, id = "name")
+```
+
+------------------------------------------------------------------------
+
+**Variables sociodémographiques sélectionnées**
+
+Cinq variables ont été retenues pour caractériser le potentiel de consommation pharmaceutique de chaque IRIS. Ces variables ont été choisies en lien avec la littérature économique sur les déterminants de la demande pharmaceutique.
+
+**La densité de population** (habitants par km2) est le premier indicateur de la demande potentielle. Un IRIS densément peuplé représente un bassin de clientèle plus important. La densité moyenne à Rennes est de 8 648 hab/km2, avec de fortes disparités entre le centre-ville (plus de 40 000 hab/km2) et la périphérie (moins de 2 000 hab/km2).
+
+**La part des 65 ans et plus** est le second indicateur clé. Les personnes âgées sont les premiers consommateurs de médicaments en France. Selon la DREES, un patient de plus de 65 ans consomme en moyenne 8 à 10 boîtes de médicaments par an, contre 3 à 4 pour une personne active. La moyenne rennaise est de 14.8%, avec des IRIS atteignant près de 40%.
+
+**La part des 0-14 ans** reflète la présence de familles avec enfants, qui génèrent une demande régulière en médicaments pédiatriques et en produits de puériculture. La moyenne est de 14.4%.
+
+**La densité de médecins** dans l'IRIS traduit une synergie médicale potentielle. Une pharmacie implantée près de cabinets médicaux bénéficie d'un flux de patients porteurs d'ordonnances.
+
+**Le score de vulnérabilité** combine la part des seniors (60%) et la part des enfants (40%). Il identifie les zones où les besoins médicaux sont structurellement élevés : $$S_{vuln} = \left(\frac{P_{65+}}{P_{total}} \times 0{,}6 + \frac{P_{0-14}}{P_{total}} \times 0{,}4\right) \times 100$$
+
+La carte ci-contre représente la part des 65 ans et plus. On observe une concentration des seniors dans les quartiers périphériques résidentiels, précisément là où la couverture pharmaceutique est la plus faible.
+
+------------------------------------------------------------------------
+
+### Tâche 1 : Pharmacies existantes et déserts pharmaceutiques {data-commentary-width="420"}
+
+```{r carte_deserts}
+tm_shape(iris_rennes) +
+  tm_polygons(
+    fill        = "statut_pharma",
+    fill.scale  = tm_scale_categorical(
+                    values = c("#52b788", "#ffd166", "#e63946")
+                  ),
+    fill.legend = tm_legend(title = "Statut pharmaceutique"),
+    fill_alpha  = 0.75,
+    id          = "NOM_IRIS",
+    popup.vars  = c(
+      "Nb pharmacies"      = "nb_pharmacies",
+      "Distance min (m)"   = "dist_min_pharmacie_m",
+      "Population"         = "POP_TOTAL",
+      "Part 65+ (%)"       = "PART_65P",
+      "Desert pharma"      = "desert_pharma"
+    )
+  ) +
+  tm_shape(pharmacies) +
+  tm_dots(
+    fill        = "#1d3557",
+    size        = 0.4,
+    id          = "name",
+    fill.legend = tm_legend(title = "Pharmacies existantes")
+  )
+```
+
+------------------------------------------------------------------------
+
+**Analyse de la couverture pharmaceutique actuelle**
+
+La cartographie de la couverture pharmaceutique révèle une organisation spatiale fortement déséquilibrée.
+
+Sur les 93 IRIS de Rennes, 51 possèdent au moins une pharmacie (55% du territoire). Ces IRIS sont concentrés dans le centre-ville et les quartiers limitrophes. Les 42 IRIS restants (45%) ne disposent d'aucune pharmacie.
+
+Parmi ces 42 IRIS sans pharmacie, 20 constituent des déserts pharmaceutiques au sens strict, c'est-à-dire des zones dont le centroïde est situé à plus de 500 mètres de toute officine. Ce seuil de 500 mètres correspond à environ 6 à 7 minutes de marche, considérée comme la limite d'accessibilité pédestre acceptable pour des populations âgées ou à mobilité réduite.
+
+La population résidant dans ces déserts pharmaceutiques représente environ 18% de la population rennaise totale, soit plus de 40 000 habitants insuffisamment couverts.
+
+**Code couleur de la carte**
+
+En vert figurent les IRIS disposant d'au moins une pharmacie. En jaune sont représentés les IRIS sans pharmacie mais situés à moins de 500 mètres d'une officine. En rouge apparaissent les déserts pharmaceutiques, pour lesquels la distance dépasse le seuil critique de 500 mètres.
+
+La concentration des zones rouges dans les quartiers périphériques est visuellement très nette. Cette concentration sera confirmée et quantifiée dans les pages suivantes par les tests d'autocorrélation spatiale.
+
+------------------------------------------------------------------------
+
+### Tâche 2 : Autocorrélation spatiale globale {data-commentary-width="420"}
+
+```{r moran_plot}
+y_raw <- iris_rennes$dist_min_pharmacie_m
+y_raw[is.na(y_raw)] <- mean(y_raw, na.rm = TRUE)
+y_std <- as.numeric(scale(y_raw))
+y_lag <- lag.listw(W_queen, y_std, zero.policy = TRUE)
+
+moran_val <- moran.test(y_raw, W_queen,
+                        randomisation = TRUE, zero.policy = TRUE)
+I_val <- round(moran_val$estimate["Moran I statistic"], 3)
+p_val <- round(moran_val$p.value, 4)
+
+quadrant <- case_when(
+  y_std >= 0 & y_lag >= 0 ~ "HH",
+  y_std <  0 & y_lag <  0 ~ "LL",
+  y_std >= 0 & y_lag <  0 ~ "HL",
+  y_std <  0 & y_lag >= 0 ~ "LH"
+)
+
+df_moran_plot <- data.frame(
+  y_std    = y_std,
+  y_lag    = y_lag,
+  quadrant = quadrant,
+  NOM_IRIS = iris_rennes$NOM_IRIS
+)
+
+p_moran <- ggplot(df_moran_plot,
+                  aes(x = y_std, y = y_lag,
+                      color = quadrant,
+                      text  = NOM_IRIS)) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.5) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#e63946", linewidth = 1,
+              inherit.aes = FALSE,
+              aes(x = y_std, y = y_lag)) +
+  annotate("text", x =  2.2, y =  2.8, label = "HH",
+           fontface = "bold", color = "#e63946", size = 5) +
+  annotate("text", x = -2.2, y = -2.2, label = "LL",
+           fontface = "bold", color = "#457b9d", size = 5) +
+  annotate("text", x =  2.2, y = -2.2, label = "HL",
+           fontface = "bold", color = "#f4a261", size = 5) +
+  annotate("text", x = -2.2, y =  2.8, label = "LH",
+           fontface = "bold", color = "#2a9d8f", size = 5) +
+  scale_color_manual(
+    name   = "Quadrant",
+    values = c("HH" = "#e63946", "LL" = "#457b9d",
+               "HL" = "#f4a261", "LH" = "#2a9d8f")
+  ) +
+  labs(
+    title    = paste0("Diagramme de Moran  (I = ", I_val,
+                      "  |  p-value = ", p_val, ")"),
+    subtitle = "Variable : distance a la pharmacie la plus proche | Matrice Queen",
+    x        = "Distance standardisee (z-score)",
+    y        = "Lag spatial (moyenne des voisins)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplotly(p_moran, tooltip = c("text", "x", "y"))
+```
+
+------------------------------------------------------------------------
+
+**Méthode : l'indice de Moran**
+
+L'autocorrélation spatiale mesure la tendance des observations voisines à présenter des valeurs similaires. L'indice de Moran I en est la mesure la plus couramment utilisée. Il est défini par la formule suivante, où $y_i$ est la valeur de la variable pour l'IRIS i, $\bar{y}$ est la moyenne globale, et $w_{ij}$ est le poids de la matrice de pondération spatiale W :
+
+$$I = \frac{N}{\sum_{i}\sum_{j} w_{ij}} \times \frac{\sum_{i}\sum_{j} w_{ij}(y_i - \bar{y})(y_j - \bar{y})}{\sum_{i}(y_i - \bar{y})^2}$$
+
+Sous l'hypothèse nulle d'absence d'autocorrélation spatiale, l'espérance de I vaut $E[I] = \frac{-1}{N-1}$. La significativité est testée par l'hypothèse de normalité asymptotique et par randomisation (permutations Monte Carlo).
+
+**Robustesse des résultats : comparaison de quatre matrices W**
+
+Quatre matrices ont été testées pour vérifier la robustesse des résultats au choix du voisinage.
+
+```{r tableau_moran}
+comp_W %>%
+  rename(
+    "Matrice W"  = Voisinage,
+    "I de Moran" = I_W,
+    "p-value"    = p_value,
+    "Decision"   = H0
+  ) %>%
+  kable(digits = 4, align = "c") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = FALSE
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#1a1a2e", color = "white")
+```
+
+**Interprétation**
+
+L'indice de Moran vaut 0.278 avec une p-value inférieure à 0.0001 pour la matrice Queen. Ce résultat est robuste : H0 est rejetée pour les quatre matrices testées. Les déserts pharmaceutiques se regroupent donc géographiquement de façon non aléatoire.
+
+La valeur positive de I indique une autocorrélation positive : les IRIS éloignés d'une pharmacie tendent à être entourés d'IRIS également éloignés. Le diagramme de Moran interactif illustre cette structure. Les points rouges dans le quadrant HH (en haut à droite) représentent les zones prioritaires pour l'implantation.
+
+------------------------------------------------------------------------
+
+### Tâche 2 : Clusters LISA {data-commentary-width="420"}
+
+```{r carte_lisa}
+tm_shape(iris_rennes) +
+  tm_polygons(
+    fill        = "lisa_cluster_label",
+    fill.scale  = tm_scale_categorical(
+                    values = c(
+                      "#e63946", "#f4a261",
+                      "#2a9d8f", "#457b9d", "#f0f0f0"
+                    )
+                  ),
+    fill.legend = tm_legend(title = "Clusters LISA"),
+    fill_alpha  = 0.8,
+    id          = "NOM_IRIS",
+    popup.vars  = c(
+      "Cluster"            = "lisa_cluster_label",
+      "I local"            = "lisa_I",
+      "p-value locale"     = "lisa_p",
+      "Distance pharma(m)" = "dist_min_pharmacie_m",
+      "Population"         = "POP_TOTAL"
+    )
+  ) +
+  tm_shape(pharmacies) +
+  tm_dots(
+    fill        = "white",
+    size        = 0.4,
+    col         = "#1d3557",
+    id          = "name",
+    fill.legend = tm_legend(title = "Pharmacies")
+  )
+```
+
+------------------------------------------------------------------------
+
+**Méthode : les indicateurs locaux de Moran (LISA)**
+
+L'indice de Moran global suppose que l'autocorrélation spatiale est uniforme sur l'ensemble du territoire, ce que l'on appelle la stationnarité du processus spatial. Cette hypothèse est rarement vérifiée en milieu urbain, où les structures spatiales varient fortement d'un quartier à l'autre. Les LISA (Local Indicators of Spatial Autocorrelation, Anselin 1995) permettent de lever cette hypothèse.
+
+L'indice local de Moran pour l'IRIS i est calculé ainsi :
+
+$$I_i = (y_i - \bar{y}) \sum_{j \neq i} w_{ij}(y_j - \bar{y})$$
+
+Une valeur Ii positive indique un regroupement de valeurs similaires autour de l'IRIS i. La significativité de chaque Ii est testée par randomisation au seuil de 5%.
+
+**Interprétation des quatre types de clusters**
+
+Les clusters HH (rouge) regroupent les IRIS très éloignés d'une pharmacie et entourés de voisins dans la même situation. Ce sont les zones de sous-couverture structurelle et les cibles prioritaires pour une nouvelle implantation.
+
+Les clusters LL (bleu) sont les IRIS bien desservis entourés de voisins bien desservis. Ils correspondent au centre-ville dense de Rennes où la concurrence est déjà forte.
+
+Les clusters HL (orange) sont des déserts isolés entourés de zones bien couvertes : leur situation les rend moins urgents.
+
+Les clusters LH (vert) sont des IRIS bien couverts au sein d'une zone peu desservie.
+
+**Résultats**
+
+On dénombre 4 clusters HH significatifs, 2 clusters LL et 3 clusters LH. Les 84 IRIS restants ne présentent pas de structure locale significative. Les 4 zones HH constituent les cibles prioritaires de notre analyse.
+
+------------------------------------------------------------------------
+
+### Tâche 2 : Processus ponctuels et Fonction K de Ripley {data-commentary-width="420"}
+
+```{r ripley_plot}
+df_K <- resultats_ripley$K_pharma
+df_L <- resultats_ripley$L_pharma
+
+p_K <- ggplot(df_K) +
+  geom_ribbon(aes(x = r, ymin = lo, ymax = hi),
+              fill = "#adb5bd", alpha = 0.4) +
+  geom_line(aes(x = r, y = theo,
+                linetype = "Theorique CSR"),
+            color = "#e63946", linewidth = 0.8) +
+  geom_line(aes(x = r, y = obs,
+                linetype = "Observee"),
+            color = "#1d3557", linewidth = 1) +
+  scale_linetype_manual(
+    name   = "",
+    values = c("Theorique CSR" = "dashed", "Observee" = "solid")
+  ) +
+  scale_x_continuous(labels = scales::comma_format(suffix = "m")) +
+  labs(
+    title    = "Fonction K de Ripley : pharmacies de Rennes",
+    subtitle = "Zone grise = enveloppe Monte Carlo (199 simulations, alpha = 5%)",
+    x        = "Distance r (m)",
+    y        = "K(r)",
+    caption  = paste0(
+      "Intensite homogene : ",
+      round(resultats_ripley$lambda_pharma * 1e6, 2),
+      " pharmacies/km2  |  Test CSR : Chi2 = ",
+      round(resultats_ripley$quadrat_test$chi2, 1),
+      "  |  p < 0.001"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+p_L <- ggplot(df_L) +
+  geom_ribbon(aes(x = r, ymin = lo, ymax = hi),
+              fill = "#adb5bd", alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "#e63946",
+             linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(x = r, y = obs),
+            color = "#1d3557", linewidth = 1) +
+  scale_x_continuous(labels = scales::comma_format(suffix = "m")) +
+  labs(
+    title    = "Fonction L de Besag : L(r) - r",
+    subtitle = "Attendu = 0 sous H0 (CSR)  |  Au-dessus de 0 = agregation",
+    x        = "Distance r (m)",
+    y        = "L(r) - r"
+  ) +
+  theme_minimal(base_size = 12)
+
+subplot(
+  ggplotly(p_K),
+  ggplotly(p_L),
+  nrows  = 1,
+  shareX = TRUE,
+  titleX = TRUE,
+  titleY = TRUE
+)
+```
+
+------------------------------------------------------------------------
+
+**Méthode : l'analyse des processus ponctuels**
+
+L'analyse des processus ponctuels considère chaque pharmacie comme un point géolocalisé dans l'espace, et cherche à caractériser la structure sous-jacente de cette configuration. Trois types de distributions peuvent être observées : aléatoire (processus de Poisson homogène ou CSR), agrégée, ou régulière.
+
+**Test de l'hypothèse CSR**
+
+Le processus de Poisson homogène constitue l'hypothèse nulle de référence. Il suppose que chaque point est placé indépendamment des autres avec une probabilité uniforme. Le test du quadrat (chi-carré sur une grille 5x5) donne Chi2 = 342.2 avec 24 degrés de liberté (p inférieur à 0.001). L'hypothèse nulle est très clairement rejetée : les pharmacies ne sont pas distribuées au hasard.
+
+L'intensité homogène estimée est de 2.38 pharmacies par km2.
+
+**Fonction K de Ripley**
+
+La fonction K(r) donne le nombre moyen de voisins d'un point dans un disque de rayon r, normalisé par l'intensité du processus. Elle est estimée par :
+
+$$\hat{K}(r) = \frac{|W|}{n(n-1)} \sum_{i} \sum_{j \neq i}
+\mathbf{1}\left\{||x_i - x_j|| \leq r\right\} \, c(x_i, x_j; r)$$
+
+où $|W|$ est la superficie de la fenêtre d'observation (la commune de Rennes), $n$ est le nombre total de pharmacies, $\mathbf{1}\{\cdot\}$ est la fonction indicatrice valant 1 si les points $x_i$ et $x_j$ sont distants d'au plus $r$ mètres, et $c(x_i, x_j; r)$ est le facteur de correction des effets de bord de Ripley, qui compense la sous-estimation due aux voisins situés hors de la fenêtre d'observation.
+
+Sous l'hypothèse CSR (processus de Poisson homogène), la valeur théorique attendue est $K_{CSR}(r) = \pi r^2$. La courbe observée dépasse très largement l'enveloppe Monte Carlo pour $r < 800$ mètres, indiquant une forte agrégation des pharmacies à courte portée. Cette agrégation reflète leur concentration autour du centre-ville et des pôles hospitaliers rennais.
+
+**Fonction L de Besag**
+
+La fonction L de Besag est une transformation stabilisatrice de la variance de $\hat{K}(r)$, proposée pour faciliter l'interprétation graphique :
+
+$$\hat{L}(r) = \sqrt{\frac{\hat{K}(r)}{\pi}}$$
+
+Sous l'hypothèse CSR, $\hat{L}(r) = r$, ce qui permet de tester graphiquement la déviation à la référence via la quantité :
+
+$$\hat{L}(r) - r = 0 \quad \text{sous CSR}$$
+
+Une valeur $\hat{L}(r) - r > 0$ indique une agrégation des points à la distance $r$, tandis qu'une valeur négative traduit une répulsion spatiale. La courbe observée est nettement positive pour $r < 800$ mètres, confirmant l'agrégation à courte portée déjà détectée par la fonction K. Ce résultat est cohérent avec la logique commerciale des officines françaises, qui se concentrent historiquement autour des pôles médicaux et des zones de forte fréquentation piétonne. 
+
+------------------------------------------------------------------------
+
+### Tâche 2 : KDE et fonction D de Diggle {data-commentary-width="420"}
+
+```{r kde_diggle}
+df_D <- resultats_ripley$D_diggle
+
+p_diggle <- ggplot(df_D) +
+  geom_ribbon(aes(x = r, ymin = lo, ymax = hi),
+              fill = "#adb5bd", alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "#e63946",
+             linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(x = r, y = D),
+            color = "#1d3557", linewidth = 1.2) +
+  scale_x_continuous(labels = scales::comma_format(suffix = "m")) +
+  labs(
+    title    = "Fonction D de Diggle : pharmacies vs medecins",
+    subtitle = paste0(
+      "D(r) = K_pharmacies(r) - K_medecins(r)  |  ",
+      "Zone grise = enveloppe permutations (199 sim.)"
+    ),
+    x        = "Distance r (m)",
+    y        = "D(r)",
+    caption  = paste0(
+      "D(r) > 0 : pharmacies plus agregees que medecins  |  ",
+      "D(r) < 0 : medecins plus agreges que pharmacies"
+    )
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplotly(p_diggle)
+```
+
+------------------------------------------------------------------------
+
+**Estimation de l'intensité spatiale par KDE**
+
+L'estimateur à noyau (Kernel Density Estimation) permet d'estimer la fonction d'intensité non homogène lambda(x) en tout point de l'espace. La bande passante optimale calculée par la règle de Scott est de 461 mètres.
+
+La carte KDE révèle trois pôles pharmaceutiques principaux : le centre-ville historique autour de la place de la République, le quartier du CHU de Pontchaillou, et le quartier de la gare. En revanche, les quartiers périphériques présentent une intensité quasi nulle, confirmant visuellement les résultats de l'autocorrélation spatiale.
+
+**Fonction K inhomogène de Baddeley**
+
+La fonction K standard suppose l'homogénéité du processus, ce qui est clairement invalide ici. La fonction Kinhom de Baddeley et al. (2000) corrige ce biais en pondérant chaque paire de points par l'inverse du produit de leurs intensités locales. Les résultats montrent qu'une légère agrégation persiste après correction, suggérant un phénomène de co-localisation entre pharmacies indépendant de la densité de population.
+
+**Fonction D de Diggle**
+
+La fonction $D(r) = \hat{K}_{pharmacies}(r) - \hat{K}_{medecins}(r)$ compare les structures spatiales des pharmacies et des médecins. Les médecins constituent une population de référence dont la distribution reflète la demande médicale générale.
+
+La courbe D(r) reste proche de zéro pour des distances inférieures à 400 mètres, indiquant des structures similaires à courte portée entre pharmacies et médecins. Elle devient légèrement positive entre 400 et 1200 mètres, montrant que les pharmacies tendent à se concentrer davantage à moyenne distance. Ce résultat suggère une sur-agrégation des officines dans certains micro-pôles commerciaux, au-delà de ce que la seule demande médicale expliquerait.
+
+------------------------------------------------------------------------
+
+### Tâche 3 : Score composite et zones candidates {data-commentary-width="420"}
+
+```{r carte_score}
+tm_shape(iris_rennes) +
+  tm_polygons(
+    fill        = "SCORE_COMPOSITE",
+    fill.scale  = tm_scale_intervals(style   = "quantile",
+                                     values  = "-rocket",
+                                     n       = 5),
+    fill.legend = tm_legend(title = "Score composite (0-100)"),
+    fill_alpha  = 0.75,
+    id          = "NOM_IRIS",
+    popup.vars  = c(
+      "Score composite"     = "SCORE_COMPOSITE",
+      "Population"          = "POP_TOTAL",
+      "Distance pharma (m)" = "dist_min_pharmacie_m",
+      "Part 65+ (%)"        = "PART_65P",
+      "Nb medecins"         = "nb_medecins",
+      "Nb transport"        = "nb_transport"
+    )
+  ) +
+  tm_shape(pharmacies) +
+  tm_dots(fill = "white", size = 0.4, col = "#1d3557", id = "name") +
+  tm_shape(hopitaux) +
+  tm_dots(fill = "#2d6a4f", size = 0.4, shape = 15, id = "name")
+```
+
+------------------------------------------------------------------------
+
+**Construction du score composite multicritère**
+
+La recommandation d'implantation repose sur un score composite construit à partir de six critères normalisés entre 0 et 100. Seuls les IRIS comptant au moins 500 habitants ont été inclus (86 IRIS sur 93). Les 7 IRIS exclus correspondent à des zones naturelles, des parcs ou des zones d'activités sans résidents permanents.
+
+La pondération des critères a été construite de la façon suivante.
+
+La **distance à la pharmacie la plus proche** reçoit le poids le plus élevé (30%) car elle mesure directement le déficit d'accessibilité.
+
+La **densité de population** (25%) détermine le volume de clientèle potentielle.
+
+La **part des 65 ans et plus** (20%) reflète le besoin médicamenteux structurel.
+
+La **présence de médecins** (10%) traduit une synergie médicale potentielle.
+
+L'**accessibilité en transport** (10%) garantit un bassin de clientèle élargi.
+
+La **part des 0-14 ans** (5%) reflète la demande en médicaments pédiatriques.
+
+**Top 10 des IRIS candidats**
+
+```{r top10}
+top10 %>%
+  select(rang, NOM_IRIS, SCORE_COMPOSITE,
+         dist_min_pharmacie_m, POP_TOTAL, PART_65P) %>%
+  rename(
+    "Rang"         = rang,
+    "IRIS"         = NOM_IRIS,
+    "Score (/100)" = SCORE_COMPOSITE,
+    "Distance (m)" = dist_min_pharmacie_m,
+    "Population"   = POP_TOTAL,
+    "Part 65+ (%)" = PART_65P
+  ) %>%
+  kable(digits = 1, align = c("c", "l", "c", "c", "c", "c")) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#1a1a2e", color = "white") %>%
+  row_spec(1, bold = TRUE, background = "#ffeaa7")
+```
+
+------------------------------------------------------------------------
+
+### Tâche 3 : Recommandation finale {data-commentary-width="420"}
+
+```{r profil_optimal}
+nom_optimal <- iris_optimal$NOM_IRIS
+
+df_radar_long <- df_radar %>%
+  pivot_longer(
+    cols      = c(iris_optimal, moyenne_rennes),
+    names_to  = "groupe",
+    values_to = "score"
+  ) %>%
+  mutate(
+    groupe = case_when(
+      groupe == "iris_optimal"   ~
+        paste0("IRIS optimal : ", nom_optimal),
+      groupe == "moyenne_rennes" ~
+        "Moyenne Rennes (86 IRIS scores)",
+      TRUE ~ groupe
+    )
+  )
+
+p_profil <- ggplot(
+  df_radar_long,
+  aes(x    = critere,
+      y    = score,
+      fill = groupe,
+      text = paste0(groupe, " : ", round(score, 1), "/100"))
+) +
+  geom_col(position = "dodge", width = 0.6, alpha = 0.9) +
+  geom_hline(yintercept = 50, linetype = "dashed",
+             color = "grey50", linewidth = 0.5) +
+  scale_fill_manual(
+    name   = "",
+    values = c("#e63946", "#adb5bd")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    labels = function(x) paste0(x, "/100")
+  ) +
+  labs(
+    title    = paste0("Profil de l'IRIS optimal (",
+                      nom_optimal, ") vs moyenne Rennes"),
+    subtitle = "Score normalise 0-100 pour chaque critere du scoring composite",
+    x        = NULL,
+    y        = "Score (0-100)",
+    caption  = "Ligne pointillee = score median (50/100)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    axis.text.x     = element_text(size = 10)
+  )
+
+ggplotly(p_profil, tooltip = "text")
+```
+
+------------------------------------------------------------------------
+
+**Justification du choix : IRIS Saint-Laurent**
+
+L'IRIS Saint-Laurent (code INSEE 352380509) est recommandé comme zone optimale pour l'implantation d'une nouvelle pharmacie à Rennes, avec un score composite de 41.4 sur 100, soit 2.7 points au-dessus du deuxième IRIS classé.
+
+**Un désert pharmaceutique avéré.** La distance de 720 mètres à la pharmacie la plus proche dépasse largement le seuil de 500 mètres. Cette distance équivaut à environ 9 minutes de marche, ce qui est dissuasif pour les personnes âgées ou à mobilité réduite.
+
+**Une population âgée à fort besoin médicamenteux.** La part des 65 ans et plus atteint 29.7% dans cet IRIS, soit exactement le double de la moyenne rennaise (14.9%). Une pharmacie implantée ici bénéficierait d'une clientèle structurelle à forte consommation pharmaceutique.
+
+**Une bonne accessibilité.** Avec 13 arrêts de transport en commun, l'IRIS Saint-Laurent se situe nettement au-dessus de la moyenne rennaise (7.4 arrêts), garantissant un bassin de clientèle élargi au-delà des seuls résidents.
+
+**Absence de concurrence directe.** Aucune pharmacie n'est présente dans l'IRIS, et l'analyse LISA a confirmé que les IRIS voisins sont également sous-dotés (cluster HH). Il n'y a donc aucun risque de cannibalisation.
+
+**Tableau comparatif détaillé**
+
+```{r tableau_comp}
+tableau_comp %>%
+  rename(
+    "Variable"      = Variable,
+    "Saint-Laurent" = IRIS_optimal,
+    "Moy. Rennes"   = Moyenne,
+    "Med. Rennes"   = Mediane,
+    "Min"           = Min,
+    "Max"           = Max,
+    "Ecart-type"    = Ecart_type
+  ) %>%
+  kable(digits = 2, align = c("l", rep("c", 6))) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    font_size         = 12
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#1a1a2e", color = "white") %>%
+  row_spec(8, bold = TRUE, background = "#ffeaa7")
+```
+
+------------------------------------------------------------------------
+
+### Bibliographie et sources {data-commentary-width=800}
+
+```{r bilan_final}
+library(htmltools)
+library(leaflet)
+
+# Coordonnées de Saint-Laurent (IRIS optimal)
+iris_opt <- iris_rennes %>% filter(CODE_IRIS == iris_optimal$CODE_IRIS)
+centroid_opt <- st_centroid(iris_opt) %>% st_transform(4326)
+lng_opt <- st_coordinates(centroid_opt)[1]
+lat_opt <- st_coordinates(centroid_opt)[2]
+
+# Pharmacies en WGS84 pour leaflet
+pharmacies_wgs84 <- pharmacies %>% st_transform(4326)
+iris_wgs84       <- iris_rennes %>% st_transform(4326)
+
+# Valueboxes
+vboxes <- htmltools::div(
+  style = "display:flex; gap:10px; margin-bottom:15px;",
+  htmltools::div(
+    style = "flex:1; background:#e63946; color:white; padding:15px;
+             border-radius:8px; text-align:center;",
+    htmltools::h4("Saint-Laurent", style = "margin:0; font-size:1.1em;"),
+    htmltools::p("IRIS recommandé", style = "margin:4px 0 0 0; font-size:0.85em;")
+  ),
+  htmltools::div(
+    style = "flex:1; background:#f4a261; color:white; padding:15px;
+             border-radius:8px; text-align:center;",
+    htmltools::h4("41.4 / 100", style = "margin:0; font-size:1.1em;"),
+    htmltools::p("Score composite", style = "margin:4px 0 0 0; font-size:0.85em;")
+  ),
+  htmltools::div(
+    style = "flex:1; background:#2a9d8f; color:white; padding:15px;
+             border-radius:8px; text-align:center;",
+    htmltools::h4("720 m", style = "margin:0; font-size:1.1em;"),
+    htmltools::p("Distance pharmacie", style = "margin:4px 0 0 0; font-size:0.85em;")
+  ),
+  htmltools::div(
+    style = "flex:1; background:#457b9d; color:white; padding:15px;
+             border-radius:8px; text-align:center;",
+    htmltools::h4("29.7%", style = "margin:0; font-size:1.1em;"),
+    htmltools::p("Part 65 ans et plus", style = "margin:4px 0 0 0; font-size:0.85em;")
+  )
+)
+
+# Carte leaflet
+carte <- leaflet(height = "450px") %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  setView(lng = lng_opt, lat = lat_opt, zoom = 14) %>%
+
+  # Tous les IRIS en gris transparent
+  addPolygons(
+    data        = iris_wgs84,
+    fillColor   = "grey",
+    fillOpacity = 0.15,
+    color       = "white",
+    weight      = 0.8,
+    label       = ~NOM_IRIS
+  ) %>%
+
+  # IRIS Saint-Laurent en rouge
+  addPolygons(
+    data        = iris_wgs84 %>%
+                    filter(CODE_IRIS == iris_optimal$CODE_IRIS),
+    fillColor   = "#e63946",
+    fillOpacity = 0.55,
+    color       = "#c1121f",
+    weight      = 2.5,
+    label       = "Saint-Laurent — IRIS recommandé",
+    popup       = paste0(
+      "<b>IRIS Saint-Laurent</b><br>",
+      "Score composite : 41.4 / 100<br>",
+      "Population : ", round(iris_optimal$POP_TOTAL), " hab.<br>",
+      "Part 65+ : ", round(iris_optimal$PART_65P * 100, 1), "%<br>",
+      "Distance pharmacie : 720 m<br>",
+      "Arrêts transport : 13"
+    )
+  ) %>%
+
+  # Déserts pharmaceutiques en orange
+  addPolygons(
+    data        = iris_wgs84 %>%
+                    filter(desert_pharma == 1,
+                           CODE_IRIS != iris_optimal$CODE_IRIS),
+    fillColor   = "#ffd166",
+    fillOpacity = 0.4,
+    color       = "#f4a261",
+    weight      = 1,
+    label       = ~paste0(NOM_IRIS, " — Désert pharmaceutique")
+  ) %>%
+
+  # Pharmacies existantes
+  addCircleMarkers(
+    data        = pharmacies_wgs84,
+    radius      = 5,
+    color       = "#1d3557",
+    fillColor   = "#1d3557",
+    fillOpacity = 0.8,
+    weight      = 1,
+    label       = ~name,
+    group       = "Pharmacies"
+  ) %>%
+
+  # Marqueur centroïde Saint-Laurent
+  addAwesomeMarkers(
+    lng  = lng_opt,
+    lat  = lat_opt,
+    icon = awesomeIcons(
+      icon          = "home",
+      library       = "fa",
+      markerColor   = "red",
+      iconColor     = "white"
+    ),
+    popup = "<b>Zone recommandée</b><br>Saint-Laurent<br>Score : 41.4/100"
+  ) %>%
+
+  # Légende
+  addLegend(
+    position = "bottomright",
+    colors   = c("#e63946", "#ffd166", "#1d3557"),
+    labels   = c("Zone recommandée (Saint-Laurent)",
+                 "Autres déserts pharmaceutiques",
+                 "Pharmacies existantes"),
+    title    = "Légende",
+    opacity  = 0.8
+  ) %>%
+
+  addLayersControl(
+    overlayGroups = "Pharmacies",
+    options       = layersControlOptions(collapsed = FALSE)
+  )
+
+# Assemblage final
+htmltools::tagList(vboxes, carte)
+```
+
+------------------------------------------------------------------------
+
+**Références bibliographiques**
+
+Anselin, L. (1995). Local Indicators of Spatial Association : LISA. *Geographical Analysis*, 27(2), 93-115.
+
+Baddeley, A., Moller, J. et Waagepetersen, R. (2000). Non- and semi-parametric estimation of interaction in inhomogeneous point patterns. *Statistica Neerlandica*, 54(3), 329-350.
+
+Cliff, A.D. et Ord, J.K. (1981). *Spatial Processes : Models and Applications*. Pion, Londres.
+
+Moran, P.A.P. (1950). Notes on continuous stochastic phenomena. *Biometrika*, 37(1-2), 17-23.
+
+Ripley, B.D. (1976). The second-order analysis of stationary point processes. *Journal of Applied Probability*, 13(2), 255-266.
+
+Tobler, W. (1970). A computer movie simulating urban growth in the Detroit region. *Economic Geography*, 46, 234-240.
+
+**Sources de données**
+
+INSEE (2022). Recensement de la Population 2022 : base des indicateurs communaux et infra-communaux au niveau IRIS. Disponible sur : <https://www.insee.fr/fr/statistiques/7706119>
+
+IGN (2024). CONTOURS-IRIS, edition 2024. Disponible sur : <https://geoservices.ign.fr/contoursiris>
+
+OpenStreetMap contributors (2024). Donnees collectees en mars 2024 via le package osmdata. Disponible sur : <https://www.openstreetmap.org>
+
+**Packages R utilisés**
+
+Bivand R., Pebesma E., Gomez-Rubio V. (2013). *Applied Spatial Data Analysis with R*, 2e edition. Springer.
+
+Pebesma E. (2018). Simple Features for R. *The R Journal*, 10(1), 439-446.
+
+Baddeley A., Rubak E., Turner R. (2015). *Spatial Point Patterns : Methodology and Applications with R*. Chapman and Hall/CRC Press.
+
+Tennekes M. (2018). tmap : Thematic Maps in R. *Journal of Statistical Software*, 84(6), 1-39.
+
+**Note méthodologique**
+
+Le seuil de 500 mètres utilisé pour définir les déserts pharmaceutiques est conforme aux recommandations de l'Ordre National des Pharmaciens. Il correspond à une distance de marche d'environ 6 à 7 minutes, considérée comme la limite d'accessibilité pédestre acceptable pour des populations âgées ou à mobilité réduite.
+
+Les données de population proviennent du Recensement 2022 (publié en 2024). Les données OpenStreetMap ont été collectées en mars 2024. Les 7 IRIS exclus du scoring (moins de 500 habitants) correspondent aux zones naturelles et parcs de Rennes, pour lesquels l'implantation d'une pharmacie serait sans pertinence commerciale.
